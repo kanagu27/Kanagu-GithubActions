@@ -1,0 +1,167 @@
+# STEP 13 — Secure the ARTIFACT: scan the image, publish an SBOM, sign it.
+#
+# 🎯 GOAL: your code can be perfect and your image still ship a critical CVE —
+#          because an image is mostly other people's software.
+#
+# Our image is `python:3.12-slim` plus a handful of wheels. Steps 11's scans
+# never looked at the base OS layer at all. Trivy looks at everything actually
+# inside the image: OS packages, Python packages, and the layers underneath.
+#
+# ── Three artifacts, three different jobs ─────────────────────────────────
+#
+# 1. VULNERABILITY SCAN (trivy) — "does this image contain known CVEs?"
+#    Blocks on CRITICAL/HIGH; reports the rest.
+#
+# 2. SBOM (Software Bill of Materials) — a machine-readable inventory of
+#    everything in the image. When the next Log4Shell lands, an SBOM answers
+#    "are we affected, and where?" in seconds instead of days. Increasingly a
+#    procurement and compliance requirement, not just good practice.
+#
+# 3. SIGNATURE (cosign, keyless) — proves THIS image came from THIS repo's
+#    pipeline. Without it, anyone who can push to your registry can put an
+#    image under your tag and your cluster will happily run it. Keyless
+#    signing uses the same OIDC identity as our AWS login: no key to manage.
+#
+# 📋 SETUP: as Step 7, plus nothing new. Signing is keyless.
+#
+# ⚠️ Scan the image AFTER building and BEFORE deploying. Scanning an image
+#    already running in production is a report, not a gate.
+#
+# 👀 OBSERVE: Trivy findings appear in the Security tab; the signature and
+#    SBOM are attached to the image in ECR alongside the manifest.
+
+name: Step 13 - Image Scan, SBOM and Signing
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  secure-image:
+    name: 🛡️ Build, scan, sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write         # OIDC: for AWS *and* for keyless signing
+      security-events: write  # to publish SARIF
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - id: meta
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-secure-${{ github.run_id }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build LOCALLY first (load, not push). We scan before anything reaches
+      # the registry, so a critical CVE never gets published at all.
+      - name: Build the image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: taskapi:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 1. Scan ───────────────────────────────────────────────────────────
+      - name: Trivy — full report (never fails the build)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: taskapi:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Publish findings to the Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Trivy — the gate (fails on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: taskapi:${{ steps.meta.outputs.tag }}
+          format: table
+          severity: 'CRITICAL,HIGH'
+          # ⬇️ THIS is what makes it a gate rather than a suggestion.
+          exit-code: '1'
+          # Do not fail on a CVE with no fix available — there is nothing the
+          # team can do about it today, and an unactionable red build is a
+          # build people learn to ignore.
+          ignore-unfixed: true
+
+      # ── 2. Push (only now that it is clean) ───────────────────────────────
+      - name: Push to ECR
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}"
+          docker tag taskapi:${{ steps.meta.outputs.tag }} "$IMAGE"
+          docker push "$IMAGE"
+          # The DIGEST, not the tag. A tag can be moved to different bytes;
+          # a digest is the bytes. Sign and record the digest.
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed $DIGEST"
+
+      # ── 3. SBOM ───────────────────────────────────────────────────────────
+      - name: Generate an SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.push.outputs.image }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom.spdx.json
+
+      # ── 4. Sign ───────────────────────────────────────────────────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless, via OIDC)
+        env:
+          # Non-interactive: take the identity from the workflow's OIDC token
+          # rather than opening a browser.
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes "${{ steps.push.outputs.digest }}"
+          echo "✅ signed — the signature records this repo, workflow and ref"
+
+      - name: Attach the SBOM to the image as an attestation
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ steps.push.outputs.digest }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### 🛡️ Secured artifact"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Digest | ${{ steps.push.outputs.digest }} |"
+            echo "| Scanned | Trivy — no unfixed CRITICAL/HIGH |"
+            echo "| SBOM | SPDX, attached as an attestation |"
+            echo "| Signed | cosign, keyless via OIDC |"
+          } >> "$GITHUB_STEP_SUMMARY"

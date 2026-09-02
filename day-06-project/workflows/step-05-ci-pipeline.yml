@@ -1,0 +1,124 @@
+# STEP 5 — Assemble the CI half of the pipeline.
+#
+# 🎯 GOAL: stop running things by hand. From now on, every push and every pull
+#          request is checked automatically.
+#
+# Steps 1-4 were four separate workflows you clicked to run. That is not CI.
+# CI means it happens whether anyone remembers or not. This file merges them
+# into one workflow with real triggers and a real shape:
+#
+#     lint ──┐
+#            ├──> ci-passed   (a single job to require in branch protection)
+#     test ──┘
+#      (matrix)
+#
+# NEW IDEAS IN THIS FILE:
+#   * on: push / pull_request — the pipeline runs itself.
+#   * PARALLEL jobs — lint and test start together; wall-clock time is the
+#     slower of the two, not the sum.
+#   * needs: — ci-passed waits for both.
+#   * concurrency — a second push cancels the now-pointless first run.
+#   * a single summary job to use as the required status check.
+#
+# 📋 AFTER THIS RUNS GREEN: Settings -> Branches -> Add branch protection rule
+#    for `main` -> Require status checks -> pick "CI passed". Now a red
+#    pipeline physically blocks the merge button. THAT is the payoff.
+#
+# 👀 OBSERVE: open a pull request and watch the checks appear on it. Push a
+#    second commit quickly and watch the first run get cancelled.
+
+name: Step 5 - CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch. A new push cancels the in-progress run for that branch,
+# because nobody cares whether the commit you have already replaced was green.
+# Note we key on github.ref, so main and each PR get their own lane.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install ruff==0.8.6
+      - run: ruff check . --output-format=github
+      - run: ruff format --check .
+
+  test:
+    name: 🧪 Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: |
+          mkdir -p reports
+          pytest --junitxml=reports/junit.xml --cov=app --cov-report=term-missing
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py${{ matrix.python-version }}
+          path: reports/
+          retention-days: 7
+
+  # ── One check to rule them all ───────────────────────────────────────────
+  # Branch protection requires checks BY NAME. With a matrix, those names
+  # change whenever you add a Python version, and the protection rule silently
+  # stops covering the new one. Requiring this single roll-up job instead means
+  # the rule keeps working no matter how the matrix grows.
+  ci-passed:
+    name: ✅ CI passed
+    needs: [lint, test]
+    # always() so this job still runs (and reports red) when something above
+    # failed. Without it, the check would be SKIPPED, and a skipped required
+    # check can let a broken PR through.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise
+        run: |
+          {
+            echo "## CI result"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|-------|--------|"
+            echo "| Lint  | ${{ needs.lint.result }} |"
+            echo "| Test  | ${{ needs.test.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if any upstream job failed
+        # needs.*.result is the list of every dependency's outcome.
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::CI failed — see the jobs above."
+          exit 1

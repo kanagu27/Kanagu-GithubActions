@@ -1,0 +1,26 @@
+# Everything here is excluded from the build context.
+#
+# It is not only about size. The context is uploaded to the Docker daemon and
+# anything copied in ends up in the image — `.git` alone can carry your whole
+# history, and a stray `.env` bakes a live secret into a layer that anyone who
+# pulls the image can read back out.
+
+.git
+.github
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+coverage.xml
+k8s
+tests
+docs
+*.md
+.env
+.env.*

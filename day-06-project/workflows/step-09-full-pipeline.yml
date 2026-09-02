@@ -1,0 +1,270 @@
+# STEP 9 — 🚀 THE COMPLETE PIPELINE: commit to production, in one file.
+#
+# 🎯 GOAL: everything from Steps 1-8 wired into a single automated path, with
+#          a human gate in front of production.
+#
+#   lint ──┐
+#          ├──> build & push ──> deploy STAGING ──> [👤 approve] ──> deploy PROD
+#   test ──┘     (ONCE, to ECR)     (automatic)                        (gated)
+#     (matrix)
+#
+# ── The two ideas that make this production-grade ─────────────────────────
+#
+# 1. BUILD ONCE, PROMOTE THE SAME ARTIFACT.
+#    The image is built in exactly one job. Staging and production both deploy
+#    the identical image — production runs the bytes staging approved. Rebuild
+#    per environment and your staging sign-off means nothing.
+#
+# 2. THE HUMAN GATE IS A GITHUB ENVIRONMENT, NOT AN "if".
+#    The production environment has a required reviewer, so the run PAUSES and
+#    waits for a click. It is also where production-only secrets live — scoped
+#    to the environment, so a staging job cannot read them even by accident.
+#
+# ── Automatic rollback ─────────────────────────────────────────────────────
+# If the production rollout or its smoke test fails, "kubectl rollout undo"
+# puts the previous version back within seconds, without waking anyone up.
+# This works because the Deployment keeps revisionHistoryLimit: 5.
+#
+# 📋 SETUP (one-time):
+#   * AWS-SETUP.md Parts 1-4 complete.
+#   * Repository VARIABLES: AWS_ROLE_ARN, AWS_REGION, AWS_ACCOUNT_ID,
+#     ECR_REPOSITORY, EKS_CLUSTER_NAME.
+#   * Settings -> Environments -> create "staging" (no protection) and
+#     "production" (Required reviewers: yourself).
+#
+# 👀 OBSERVE: push to main and watch it flow. The run stops at "Waiting" with
+#    a Review deployments button. Click Approve and production rolls out with
+#    the same image tag staging is already running.
+
+name: Step 9 - Full Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but NEVER cancel a deploy that is mid-flight on
+  # main — an interrupted rollout leaves the cluster half-updated.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ── 1. Quality gates, in parallel ────────────────────────────────────────
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install ruff==0.8.6
+      - run: ruff check . --output-format=github
+      - run: ruff format --check .
+
+  test:
+    name: 🧪 Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --cov=app --cov-report=term-missing
+
+  # ── 2. Build the artifact ONCE ───────────────────────────────────────────
+  build:
+    name: 📦 Build and push
+    needs: [lint, test]
+    # Never publish an image from a pull request: a PR from a fork is
+    # untrusted code, and pushing it to your registry hands an attacker a
+    # foothold. Pull requests get lint + test only.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: meta
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}"
+          docker buildx build --push --tag "$IMAGE" \
+            --cache-from type=gha --cache-to type=gha,mode=max \
+            --provenance=false .
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  # ── 3. Staging: automatic ────────────────────────────────────────────────
+  deploy-staging:
+    name: 🟡 Deploy to staging
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: staging
+      url: https://staging.example.com    # shown on the run and in the sidebar
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-staging-${{ github.run_id }}
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Deploy
+        env:
+          NS: taskapi-staging
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region "${{ vars.AWS_REGION }}"
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          sed -i -e "s|__IMAGE__|$IMAGE|g" -e "s|__RELEASE__|$TAG|g" -e "s|__ENVIRONMENT__|staging|g" k8s/deployment.yaml
+          kubectl apply -n "$NS" -f k8s/deployment.yaml -f k8s/service.yaml
+          kubectl rollout status deployment/taskapi -n "$NS" --timeout=5m
+
+      - name: Smoke test staging
+        env:
+          NS: taskapi-staging
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          kubectl port-forward -n "$NS" svc/taskapi 8080:80 & sleep 5
+          curl -fsS http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/ | grep -q "$TAG" \
+            && echo "✅ staging is running $TAG"
+
+  # ── 4. Production: same image, but a human says when ─────────────────────
+  deploy-production:
+    name: 🔴 Deploy to production
+    needs: [build, deploy-staging]
+    # Belt and braces: the environment gate blocks it anyway, but this makes
+    # the rule visible in the file — production only ever comes from main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: production          # ← the required reviewer pauses the run HERE
+      url: https://api.example.com
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-prod-${{ github.run_id }}
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Deploy the exact image staging approved
+        env:
+          NS: taskapi-prod
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region "${{ vars.AWS_REGION }}"
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          echo "Promoting the identical artifact: $IMAGE"
+          sed -i -e "s|__IMAGE__|$IMAGE|g" -e "s|__RELEASE__|$TAG|g" -e "s|__ENVIRONMENT__|production|g" k8s/deployment.yaml
+          kubectl apply -n "$NS" -f k8s/deployment.yaml -f k8s/service.yaml
+          kubectl rollout status deployment/taskapi -n "$NS" --timeout=5m
+
+      - name: Smoke test production
+        env:
+          NS: taskapi-prod
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          kubectl port-forward -n "$NS" svc/taskapi 8080:80 & sleep 5
+          curl -fsS --retry 5 --retry-delay 2 http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/ | grep -q "$TAG"
+
+      # ── The safety net ────────────────────────────────────────────────────
+      - name: Roll back if the rollout or the smoke test failed
+        if: failure()
+        env:
+          NS: taskapi-prod
+        run: |
+          echo "::error::production deploy failed — rolling back"
+          kubectl rollout undo deployment/taskapi -n "$NS"
+          kubectl rollout status deployment/taskapi -n "$NS" --timeout=5m
+          echo "↩️ rolled back to the previous revision"
+
+  # ── 5. Always report ─────────────────────────────────────────────────────
+  summary:
+    name: 📋 Summary
+    needs: [lint, test, build, deploy-staging, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the run summary
+        run: |
+          {
+            echo "## Pipeline result"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|-------|--------|"
+            echo "| Lint | ${{ needs.lint.result }} |"
+            echo "| Test | ${{ needs.test.result }} |"
+            echo "| Build and push | ${{ needs.build.result }} |"
+            echo "| Staging | ${{ needs.deploy-staging.result }} |"
+            echo "| Production | ${{ needs.deploy-production.result }} |"
+            echo ""
+            echo "Image tag: ${{ needs.build.outputs.tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if anything failed
+        if: contains(needs.*.result, 'failure')
+        run: exit 1

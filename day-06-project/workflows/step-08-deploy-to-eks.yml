@@ -1,0 +1,175 @@
+# STEP 8 — Deploy the image to EKS.
+#
+# 🎯 GOAL: the last mile. An image in a registry helps nobody until it is
+#          running and serving traffic.
+#
+# ── How a pipeline talks to EKS ────────────────────────────────────────────
+# It does NOT ssh anywhere. It asks the Kubernetes API server to change the
+# desired state, and the cluster reconciles itself. Three things have to line
+# up, and a failure is always one of them:
+#
+#   1. AWS identity     — the same OIDC role from Step 7.
+#   2. A kubeconfig     — `aws eks update-kubeconfig` writes one.
+#   3. CLUSTER PERMISSION — being an AWS admin does NOT make you a Kubernetes
+#      admin. The IAM role must be mapped to a Kubernetes group via an EKS
+#      Access Entry (or aws-auth). Miss this and you get:
+#          error: You must be logged in to the server (Unauthorized)
+#      That single error accounts for most "my EKS deploy won't work" posts.
+#      AWS-SETUP.md Part 4 sets it up.
+#
+# ── The deploy itself ──────────────────────────────────────────────────────
+# We substitute the image into the manifests, apply them, then WAIT:
+#
+#     kubectl rollout status --timeout=5m
+#
+# Without that wait, `kubectl apply` returns "configured" instantly and the
+# job goes green while the new pods are still crash-looping. A deploy that
+# reports success before the pods are healthy is worse than no automation at
+# all — it is automation that lies to you. `rollout status` fails the job if
+# the pods never become ready, and because maxUnavailable is 0, the OLD pods
+# keep serving traffic the whole time.
+#
+# 📋 SETUP: AWS-SETUP.md Parts 1-4, plus these repository VARIABLES:
+#      EKS_CLUSTER_NAME = taskapi-cluster
+#      K8S_NAMESPACE    = taskapi-staging
+#
+# 👀 OBSERVE: `kubectl get pods` in the log shows old pods terminating only
+#    after new ones are Ready. Zero downtime, visible in the output.
+
+name: Step 8 - Deploy to EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (short SHA). Leave blank for the current commit.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: 🚀 Deploy to EKS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Decide which tag to deploy
+        id: meta
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then TAG="$(git rev-parse --short HEAD)"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Deploying tag: $TAG"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Get cluster credentials
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region "${{ vars.AWS_REGION }}"
+          # If this next line fails with Unauthorized, the problem is the
+          # cluster ACCESS ENTRY, not AWS IAM. See AWS-SETUP.md Part 4.
+          kubectl get nodes
+
+      - name: Ensure the namespace exists
+        run: |
+          # --dry-run=client | apply is the idempotent way to do this:
+          # `kubectl create` alone fails with AlreadyExists on the 2nd run.
+          kubectl create namespace "${{ vars.K8S_NAMESPACE }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Render the manifests
+        env:
+          REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE="$REGISTRY/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}"
+
+          # Replace the placeholders the manifests ship with. Simple, visible,
+          # and no extra tool to learn. (Kustomize or Helm do this properly
+          # once you have more than one environment's worth of differences.)
+          sed -i \
+            -e "s|__IMAGE__|$IMAGE|g" \
+            -e "s|__RELEASE__|${{ steps.meta.outputs.tag }}|g" \
+            -e "s|__ENVIRONMENT__|${{ vars.K8S_NAMESPACE }}|g" \
+            k8s/deployment.yaml
+
+          echo "--- rendered deployment.yaml ---"
+          grep -E "image:|release|ENVIRONMENT" -A1 k8s/deployment.yaml
+
+      - name: Apply to the cluster
+        run: |
+          kubectl apply -n "${{ vars.K8S_NAMESPACE }}" \
+            -f k8s/deployment.yaml \
+            -f k8s/service.yaml
+
+      - name: Wait for the rollout to finish
+        # THE most important line in this file. Fails the job if the new pods
+        # never become Ready, instead of reporting a success that isn't one.
+        run: |
+          kubectl rollout status deployment/taskapi \
+            -n "${{ vars.K8S_NAMESPACE }}" \
+            --timeout=5m
+
+      - name: Smoke-test the running service
+        run: |
+          # port-forward gives us a real request against a real pod without
+          # needing a load balancer or a public DNS name — free, and it works
+          # from a runner with no inbound access to the cluster.
+          kubectl port-forward -n "${{ vars.K8S_NAMESPACE }}" \
+            svc/taskapi 8080:80 &
+          PF_PID=$!
+          sleep 5
+
+          echo "--- health ---"
+          curl -fsS http://localhost:8080/healthz
+
+          echo ""
+          echo "--- build info ---"
+          curl -fsS http://localhost:8080/ | tee /tmp/live.json
+          echo ""
+
+          # Assert the pod is running the commit we just deployed. This is the
+          # check that catches a deploy which "succeeded" but rolled out the
+          # wrong tag.
+          grep -q "${{ steps.meta.outputs.tag }}" /tmp/live.json \
+            && echo "✅ live pod reports release ${{ steps.meta.outputs.tag }}" \
+            || { echo "::error::deployed pod is NOT running the expected release"; exit 1; }
+
+          kill $PF_PID
+
+      - name: Show the cluster state
+        if: always()
+        run: |
+          kubectl get deploy,pods,svc -n "${{ vars.K8S_NAMESPACE }}" -o wide
+
+      - name: Debug on failure
+        # Only runs when something above failed. Prints the three things you
+        # would go and type by hand anyway — so the answer is already in the
+        # log by the time you open it.
+        if: failure()
+        run: |
+          echo "::group::Pod descriptions"
+          kubectl describe pods -n "${{ vars.K8S_NAMESPACE }}" -l app=taskapi
+          echo "::endgroup::"
+          echo "::group::Container logs"
+          kubectl logs -n "${{ vars.K8S_NAMESPACE }}" -l app=taskapi --tail=100 --all-containers || true
+          echo "::endgroup::"
+          echo "::group::Recent events"
+          kubectl get events -n "${{ vars.K8S_NAMESPACE }}" --sort-by=.lastTimestamp | tail -30
+          echo "::endgroup::"

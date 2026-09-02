@@ -1,0 +1,131 @@
+# STEP 7 — Push the image to Amazon ECR, with NO stored AWS keys.
+#
+# 🎯 GOAL: get the artifact into a registry EKS can pull from, and authenticate
+#          to AWS the way a professional team does it — with OIDC.
+#
+# ── The part everyone gets wrong ──────────────────────────────────────────
+# The obvious approach is to paste an AWS access key into repository secrets.
+# Do not. That key is long-lived, it works from anywhere on the internet, it
+# leaks through a log or a fork or an ex-employee's laptop, and nobody ever
+# rotates it.
+#
+# OIDC replaces it. GitHub mints a short-lived, signed token that says
+# "this is repo X, branch Y, workflow Z". AWS is configured to trust that
+# token and hands back credentials valid for about an hour, scoped to one
+# role. Nothing to store, nothing to rotate, nothing to leak.
+#
+#     GitHub run  ──(signed OIDC token)──>  AWS STS  ──(temp creds ~1h)──>  ECR
+#
+# 📋 SETUP — do AWS-SETUP.md Parts 1-3 first. You need:
+#      * an ECR repository named `taskapi`
+#      * the GitHub OIDC identity provider in your AWS account
+#      * an IAM role whose TRUST POLICY names this repo, with ECR push
+#        permissions attached
+#    Then: Settings -> Secrets and variables -> Actions -> Variables ->
+#      AWS_ROLE_ARN   = arn:aws:iam::<account-id>:role/github-actions-taskapi
+#      AWS_REGION     = ap-south-1        (or your region)
+#      ECR_REPOSITORY = taskapi
+#    These are VARIABLES, not secrets — an account ID is not a credential, and
+#    variables are readable in the log, which makes debugging far easier.
+#
+# ⚠️ THE ONE LINE PEOPLE FORGET:  permissions: id-token: write
+#    Without it there is no OIDC token to send, and the login step fails with
+#    "Could not assume role... Not authorized to perform sts:AssumeRoleWithWebIdentity".
+#
+# 👀 OBSERVE: no secret anywhere in this file. Open the ECR console after the
+#    run and find your image, tagged with the commit SHA.
+
+name: Step 7 - Push to ECR
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# Read the repo, and request an OIDC token. Nothing else.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-push:
+    name: 📦 Build and push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Publish these so the deploy job in Step 8 can consume the exact image
+    # reference we pushed, instead of guessing at it.
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute the image tag
+        id: meta
+        run: |
+          TAG="$(git rev-parse --short HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building tag: $TAG"
+
+      # ── Keyless authentication ────────────────────────────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # Shows up in CloudTrail, so an auditor can trace an API call back
+          # to the exact workflow run that made it.
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Who am I in AWS?
+        # Run this once and read the output. It is the fastest way to confirm
+        # the trust policy works, and the first thing to check when it does not.
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          IMAGE="$REGISTRY/$REPOSITORY:$TAG"
+          docker buildx build \
+            --push \
+            --tag "$IMAGE" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --provenance=false \
+            .
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "✅ pushed $IMAGE"
+
+      # Prove the image is really in the registry, and record its digest.
+      # The digest (sha256:...) is the only truly immutable identifier — a tag
+      # can be moved, a digest cannot. Production deploys often pin to it.
+      - name: Verify it landed in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ vars.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ steps.meta.outputs.tag }}" \
+            --query 'imageDetails[0].{Digest:imageDigest,Pushed:imagePushedAt,SizeMB:imageSizeInBytes}' \
+            --output table
+
+      - name: Summary
+        run: |
+          {
+            echo "### 📦 Image pushed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ steps.build.outputs.image }}\` |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Auth | OIDC — no stored AWS keys |"
+          } >> "$GITHUB_STEP_SUMMARY"

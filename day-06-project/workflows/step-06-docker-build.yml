@@ -1,0 +1,122 @@
+# STEP 6 — Package the app into a container image (build only, no push).
+#
+# 🎯 GOAL: turn source code into the ARTIFACT we will ship. Nothing leaves the
+#          runner yet — no registry, no AWS account, no credentials.
+#
+# This is the hinge of the whole pipeline. Up to now we tested SOURCE. From
+# here on we test, promote and deploy an IMAGE. The rule that follows from
+# that, and that most broken pipelines break:
+#
+#     BUILD THE IMAGE ONCE. Promote that exact image everywhere.
+#
+# Rebuild per environment and staging and production are two different
+# artifacts, so a green staging test proves nothing about production.
+#
+# TAGGING: we tag with the git SHA, never `latest`. A SHA tag is immutable —
+# it points at one commit forever, so you can always answer "what is running?"
+# and always roll back to a specific thing.
+#
+# ▶️ RUN IT on a pull request too — building on a PR catches a broken
+#    Dockerfile before merge, and pushing nothing means it is perfectly safe.
+#
+# 👀 OBSERVE: the first run builds every layer. Push a change to app/main.py
+#    and run again — the pip install layer is CACHED and the build is far
+#    faster. That is the Dockerfile's copy-order paying off.
+
+name: Step 6 - Docker Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 🐳 Build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      # Buildx is Docker's modern builder. We want it for the layer cache
+      # backed by the GitHub Actions cache, below.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Work out the image tag
+        id: tag
+        run: |
+          # The short SHA of the commit being built. This one value ties
+          # together: this run, the image, and later the running pod.
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false                     # ← nothing leaves this runner yet
+          load: true                      # load into the local docker daemon
+                                          # so the smoke test below can run it
+          tags: taskapi:${{ steps.tag.outputs.sha }}
+          # Layer cache stored in the GitHub Actions cache. Without this every
+          # run reinstalls every dependency from scratch, because each run
+          # starts on a brand-new machine with an empty Docker cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Smoke-test the image, not the source ──────────────────────────────
+      # Your tests passed against the source tree. That does not prove the
+      # IMAGE works: a missing COPY, a wrong CMD, a dependency that is in
+      # requirements-dev but not requirements — all of these pass CI and fail
+      # in the container. Two minutes here saves a broken production deploy.
+      - name: Start a container from the image we just built
+        run: |
+          docker run -d --name taskapi-test -p 8000:8000 \
+            -e RELEASE=${{ steps.tag.outputs.sha }} \
+            taskapi:${{ steps.tag.outputs.sha }}
+
+      - name: Wait for it to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/healthz > /dev/null; then
+              echo "✅ container healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::container never became healthy"
+          docker logs taskapi-test
+          exit 1
+
+      - name: Hit the API for real
+        run: |
+          echo "--- GET / ---"
+          curl -fsS http://localhost:8000/ | tee /tmp/root.json
+          echo ""
+          echo "--- POST a task ---"
+          curl -fsS -X POST http://localhost:8000/api/v1/tasks \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"built by GitHub Actions"}'
+          echo ""
+          # Assert the release we injected actually came back, which proves
+          # the env var plumbing the deploy relies on works end to end.
+          grep -q "${{ steps.tag.outputs.sha }}" /tmp/root.json \
+            && echo "✅ image reports the correct release"
+
+      - name: Show what we built
+        run: |
+          docker images taskapi:${{ steps.tag.outputs.sha }}
+          {
+            echo "### 🐳 Image built"
+            echo ""
+            echo "- Tag: \`taskapi:${{ steps.tag.outputs.sha }}\`"
+            echo "- Size: $(docker images taskapi:${{ steps.tag.outputs.sha }} --format '{{.Size}}')"
+            echo "- Pushed: no (Step 7 does that)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f taskapi-test || true

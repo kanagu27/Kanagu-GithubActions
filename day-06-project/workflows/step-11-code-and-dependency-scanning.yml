@@ -1,0 +1,154 @@
+# STEP 11 — Scan the CODE and the DEPENDENCIES.
+#
+# 🎯 GOAL: catch vulnerabilities in what you wrote, and in what you installed.
+#
+# Most of a modern Python service is not your code. Three lines in
+# requirements.txt pull in dozens of transitive packages, and any one of them
+# can carry a known CVE. Two different problems, two different tools:
+#
+#   YOUR CODE            -> bandit (fast, Python-specific) and CodeQL (deep,
+#                           dataflow-aware — it follows a value from a request
+#                           parameter into a dangerous sink).
+#   YOUR DEPENDENCIES    -> pip-audit, which checks every installed version
+#                           against the Python advisory database.
+#
+# ── Where the findings go ─────────────────────────────────────────────────
+# All three publish SARIF to the Security tab, so findings become tracked,
+# dedup'd, dismissable items with history — not log output nobody rereads.
+# That needs `security-events: write`.
+#
+# ── The judgement call: fail the build, or just report? ────────────────────
+# Fail on HIGH and CRITICAL. Report MEDIUM and LOW. A scanner that fails every
+# build on cosmetic findings gets `continue-on-error: true` within a fortnight,
+# and then it protects nothing. Block on what you would genuinely stop a
+# release for.
+#
+# 📋 SETUP: Settings -> Code security -> enable "CodeQL analysis" (default
+#    setup is fine for Python) if you want the scheduled scan too.
+#
+# 👀 OBSERVE: after the run, open the Security tab -> Code scanning alerts.
+
+name: Step 11 - Code and Dependency Scanning
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly. A dependency you installed today becomes vulnerable when a CVE
+    # is published next month — no commit of yours triggers that discovery, so
+    # something has to re-scan on a timer.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. SAST on our own code — fast feedback ──────────────────────────────
+  bandit:
+    name: 🔬 Bandit (Python SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - run: pip install bandit[sarif]==1.8.0
+
+      - name: Run bandit
+        # -r recursive, over app/ only — scanning tests produces noise like
+        # "assert used", which is the entire point of a test file.
+        # || true so a finding does not stop the SARIF upload below; the
+        # gate step decides pass/fail afterwards.
+        run: |
+          bandit -r app/ -f sarif -o bandit.sarif || true
+          bandit -r app/ -f screen || true
+
+      - name: Upload results to the Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+      - name: Fail on HIGH severity findings
+        run: |
+          # Report everything, block only on what matters.
+          bandit -r app/ --severity-level high --confidence-level high
+
+  # ── 2. Deep static analysis ──────────────────────────────────────────────
+  codeql:
+    name: 🔎 CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-extended adds lower-severity rules. Start with the
+          # default query suite; move up once you are at zero findings.
+          queries: security-extended
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  # ── 3. Known CVEs in our dependency tree ─────────────────────────────────
+  dependency-audit:
+    name: 📚 pip-audit (dependency CVEs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - run: pip install pip-audit==2.7.3
+
+      - name: Audit the runtime dependencies
+        # Only requirements.txt: a CVE in pytest never reaches production, and
+        # blocking a release on it teaches the team to ignore the scanner.
+        run: |
+          pip-audit -r requirements.txt --desc --format=columns | tee audit.txt
+
+      - name: Report to the run summary
+        if: always()
+        run: |
+          {
+            echo "### 📚 Dependency audit"
+            echo ""
+            echo "<pre>"
+            cat audit.txt
+            echo "</pre>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit
+          path: audit.txt
+          retention-days: 30

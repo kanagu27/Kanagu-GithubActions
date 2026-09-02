@@ -1,0 +1,65 @@
+# STEP 2 — Set up Python and install the dependencies.
+#
+# 🎯 GOAL: turn the bare runner into a machine that can actually run our app.
+#
+# The runner ships with *a* Python, but not necessarily the one your app needs.
+# `actions/setup-python` installs the exact version and puts it on PATH — this
+# is how you stop "works on 3.12, breaks on 3.11" from reaching production.
+#
+# Then we make it fast: `cache: 'pip'` stores the download cache between runs,
+# keyed on the hash of requirements*.txt. Same requirements = cache hit =
+# seconds instead of a fresh download every run.
+#
+# ▶️ RUN IT twice. The first run populates the cache, the second uses it.
+#
+# 👀 OBSERVE: in run 2, the setup-python step logs "Cache restored from key".
+#    Compare the install step's duration between the two runs.
+
+name: Step 2 - Setup Python
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: 🐍 Install dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          # Caches pip's download directory. The key is derived from the
+          # dependency files below — change a pinned version and the key
+          # changes, so you can never restore a stale cache. That is exactly
+          # why our requirements files are pinned with `==`.
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Show which Python we actually got
+        run: |
+          python --version
+          which python
+          pip --version
+
+      - name: Install runtime + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # requirements-dev.txt starts with `-r requirements.txt`, so this
+          # one command installs both sets.
+          pip install -r requirements-dev.txt
+
+      - name: Prove the app imports
+        run: |
+          # A 2-second sanity check that catches a broken import or a missing
+          # dependency BEFORE the slow test suite runs.
+          python -c "from app.main import app; print('app imported OK')"
+          pip list --format=columns

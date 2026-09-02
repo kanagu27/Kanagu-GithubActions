@@ -1,0 +1,58 @@
+# STEP 3 — Lint and format-check the code.
+#
+# 🎯 GOAL: fail on style problems and obvious bugs in ~5 seconds, before
+#          spending minutes on tests, a Docker build and a deploy.
+#
+# Order your pipeline CHEAPEST-FIRST. A lint error caught at second 5 costs
+# nothing; the same error caught after a 6-minute build and deploy costs six
+# minutes of everyone's attention. This principle shapes the whole pipeline.
+#
+# `ruff` is linter and formatter in one Rust binary — fast enough that nobody
+# is tempted to skip it. Its rules live in pyproject.toml, so it behaves the
+# same on your laptop as it does here.
+#
+# ▶️ TRY IT: break something on purpose — add an unused "import os" to
+#    app/main.py, commit, run, and watch F401 fail the job. Then remove it.
+#
+# 👀 OBSERVE: the whole job finishes in seconds. That is the point.
+
+name: Step 3 - Lint
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    # Without a timeout a hung job burns your Actions minutes for 6 HOURS
+    # (the platform default). Every job in this project sets one.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install ruff
+        # Only what this job needs. Installing the full dev set here would add
+        # ~20s to a job whose entire value is being fast.
+        run: pip install ruff==0.8.6
+
+      - name: Lint (bugs, unused imports, import order)
+        # --output-format=github makes ruff emit GitHub annotations, so every
+        # finding is shown INLINE on the changed line in the pull request's
+        # Files tab instead of being buried in the log.
+        run: ruff check . --output-format=github
+
+      - name: Check formatting
+        # --check only reports; it never rewrites files. A CI job that
+        # reformats your code and pushes it back is a job that fights the
+        # developer. Report here, fix locally with "ruff format .".
+        run: ruff format --check --diff .

