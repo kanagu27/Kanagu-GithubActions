@@ -79,7 +79,7 @@ jobs:
       - name: Upload the test reports
         # always() — a failed run is precisely when you need the report.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # Matrix jobs all upload at once, so the name MUST be unique per job.
           # Reuse one name and the second job errors with "an artifact with
